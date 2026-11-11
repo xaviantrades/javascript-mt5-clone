@@ -1,0 +1,22 @@
+{
+  "name": "mt5-market-data",
+  "version": "0.1.0",
+  "description": "Focused MT5 WebSocket live quotes and continuously synchronized candle history (JavaScript port)",
+  "type": "module",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node examples/stream.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}

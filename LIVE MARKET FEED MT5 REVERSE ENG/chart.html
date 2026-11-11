@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MT5 Charts</title>
+<style>
+:root{--bg:#0d1420;--panel:#141d2b;--line:#243145;--text:#dbe4f0;--mute:#7f90a8;--up:#2fbf9b;--down:#f0616d;--accent:#e8b04a}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--text);font:14px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif}
+body{display:flex;flex-direction:column}
+header{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;padding:8px 12px;background:var(--panel);border-bottom:1px solid var(--line)}
+select,input,button{background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:5px;padding:6px 10px;font:inherit}
+button{cursor:pointer}
+button:hover:not(:disabled){border-color:var(--mute)}
+button.on{background:var(--accent);border-color:var(--accent);color:#1a1405;font-weight:600}
+button:disabled{opacity:.5;cursor:default}
+:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.group{display:flex;gap:4px;align-items:center}
+label{color:var(--mute);font-size:13px}
+input[type=number]{width:84px}
+#px{font-variant-numeric:tabular-nums;min-width:20ch}
+.sp{flex:1}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--down);display:inline-block;margin-right:6px}
+.dot.ok{background:var(--up)}
+#chart{flex:1;min-height:0}
+footer{padding:6px 12px;color:var(--mute);font-size:12px;border-top:1px solid var(--line);min-height:28px}
+</style>
+</head>
+<body>
+<header>
+  <select id="sym" aria-label="Symbol"></select>
+  <div class="group" id="tfs" role="group" aria-label="Timeframe"></div>
+  <span id="px">waiting for ticks…</span>
+  <span class="sp"></span>
+  <div class="group"><label for="off">Time shift (h)</label><input id="off" type="number" step="1" value="0"></div>
+  <div class="group"><label for="bars">Older candles</label><input id="bars" type="number" min="100" step="1000" value="5000"><button id="bf">Backfill</button></div>
+  <span><span class="dot" id="dot"></span><span id="st">connecting</span></span>
+</header>
+<div id="chart"></div>
+<footer id="note">Loading…</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+const PERIOD = { M1: 60, M5: 300, M15: 900, M30: 1800, H1: 3600, H4: 14400, D1: 86400 };
+let cfg, sym, tf, digits = 5, bars = [], loading = false, noMore = false;
+let offset = Number(localStorage.getItem("mt5.offset")) || 0;
+$("off").value = offset;
+
+const chart = LightweightCharts.createChart($("chart"), {
+  autoSize: true,
+  layout: { background: { color: "#0d1420" }, textColor: "#dbe4f0" },
+  grid: { vertLines: { color: "#18222f" }, horzLines: { color: "#18222f" } },
+  timeScale: { timeVisible: true, secondsVisible: false, borderColor: "#243145" },
+  rightPriceScale: { borderColor: "#243145" },
+});
+const series = chart.addCandlestickSeries({
+  upColor: "#2fbf9b", downColor: "#f0616d", borderVisible: false,
+  wickUpColor: "#2fbf9b", wickDownColor: "#f0616d",
+});
+
+const note = (t) => ($("note").textContent = t);
+const toBar = (c) => ({ time: c.timestamp + offset * 3600, open: c.open, high: c.high, low: c.low, close: c.close });
+
+async function api(path, opt) {
+  const r = await fetch(path, opt);
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.error || r.statusText);
+  return body;
+}
+
+function setDigits() {
+  digits = cfg.digits[sym] ?? 5;
+  series.applyOptions({ priceFormat: { type: "price", precision: digits, minMove: Math.pow(10, -digits) } });
+}
+
+async function load() {
+  noMore = false;
+  const rows = await api(`/api/history?symbol=${sym}&tf=${tf}&limit=1500`);
+  bars = rows.map(toBar);
+  series.setData(bars);
+  chart.timeScale().fitContent();
+  note(bars.length ? `${bars.length} candles loaded from the local database. Scroll left for older ones.` :
+    "No candles stored yet. They appear as the feed backfills, or press Backfill.");
+}
+
+async function older() {
+  if (loading || noMore || !bars.length) return;
+  loading = true;
+  try {
+    const end = bars[0].time - offset * 3600 - 1;
+    const rows = await api(`/api/history?symbol=${sym}&tf=${tf}&limit=1000&end=${end}`);
+    if (!rows.length) { noMore = true; note("Reached the oldest stored candle. Use Backfill to fetch more from the broker."); return; }
+    const ts = chart.timeScale(), r = ts.getVisibleLogicalRange();
+    bars = rows.map(toBar).concat(bars);
+    series.setData(bars);
+    if (r) ts.setVisibleLogicalRange({ from: r.from + rows.length, to: r.to + rows.length });
+  } finally { loading = false; }
+}
+chart.timeScale().subscribeVisibleLogicalRangeChange((r) => { if (r && r.from < 15) older().catch((e) => note(e.message)); });
+
+function put(bar) {
+  const last = bars[bars.length - 1];
+  if (last && bar.time < last.time) return;
+  if (last && last.time === bar.time) bars[bars.length - 1] = bar; else bars.push(bar);
+  series.update(bar);
+}
+
+// Build the forming candle from bid ticks; the broker's own candle overwrites it when it arrives.
+function tick(q) {
+  if (q.s !== sym) return;
+  $("px").textContent = `bid ${q.bid.toFixed(digits)}  ask ${q.ask.toFixed(digits)}  spread ${(q.ask - q.bid).toFixed(digits)}`;
+  const p = PERIOD[tf], t = q.time / 1000 + offset * 3600, last = bars[bars.length - 1], b = q.bid;
+  const fresh = (time) => ({ time, open: b, high: b, low: b, close: b });
+  if (!last) put(fresh(Math.floor(t / p) * p));
+  else if (t < last.time) return;
+  else if (t < last.time + p) put({ ...last, high: Math.max(last.high, b), low: Math.min(last.low, b), close: b });
+  else put(fresh(last.time + Math.floor((t - last.time) / p) * p));
+}
+
+function setStatus(ok) {
+  $("dot").classList.toggle("ok", ok);
+  $("st").textContent = ok ? "live" : "disconnected";
+}
+
+let wasUp = false;
+function connect() {
+  const ws = new WebSocket(`ws://${location.host}/live`);
+  ws.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    if (m.t === "tick") tick(m);
+    else if (m.t === "candle") { if (m.s === sym && m.tf === tf) put(toBar(m.c)); }
+    else if (m.t === "status") {
+      setStatus(m.connected);
+      if (m.connected && !wasUp) api("/api/config").then((c) => { cfg = c; setDigits(); }).catch(() => {});
+      wasUp = m.connected;
+    } else if (m.t === "backfill" && m.symbol === sym && m.tf === tf)
+      note(`Backfilling ${m.symbol} ${m.tf}: +${m.added} candles, now back to ${new Date(m.oldest * 1000).toISOString().slice(0, 16).replace("T", " ")}`);
+  };
+  ws.onclose = () => { setStatus(false); wasUp = false; setTimeout(connect, 2000); };
+}
+
+function pick(newSym, newTf) {
+  sym = newSym; tf = newTf;
+  $("sym").value = sym;
+  for (const b of $("tfs").children) b.classList.toggle("on", b.textContent === tf);
+  $("px").textContent = "waiting for ticks…";
+  setDigits();
+  load().catch((e) => note(e.message));
+}
+
+$("sym").onchange = () => pick($("sym").value, tf);
+$("off").onchange = () => {
+  offset = Math.round(Number($("off").value)) || 0;
+  localStorage.setItem("mt5.offset", offset);
+  load().catch((e) => note(e.message));
+};
+$("bf").onclick = async () => {
+  $("bf").disabled = true;
+  note("Backfilling from the broker…");
+  try {
+    const r = await api(`/api/backfill?symbol=${sym}&tf=${tf}&bars=${Number($("bars").value) || 5000}`, { method: "POST" });
+    await load();
+    note(`Backfill finished: ${r.added} older candles saved.`);
+  } catch (e) { note(`Backfill failed: ${e.message}`); }
+  finally { $("bf").disabled = false; }
+};
+
+(async () => {
+  cfg = await api("/api/config");
+  for (const s of cfg.symbols) $("sym").add(new Option(s, s));
+  for (const t of cfg.timeframes.filter((t) => PERIOD[t])) {
+    const b = document.createElement("button");
+    b.textContent = t;
+    b.onclick = () => pick(sym, t);
+    $("tfs").append(b);
+  }
+  connect();
+  pick(cfg.symbols[0], cfg.timeframes.find((t) => PERIOD[t]) || "M1");
+})().catch((e) => note(`Could not start: ${e.message}`));
+</script>
+</body>
+</html>
